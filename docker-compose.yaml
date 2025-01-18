@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7.0-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  bot:
+    build: .
+    container_name: bot
+    depends_on:
+      - redis
+    environment:
+      - BOT_TOKEN=PUT_YOUR_TOKEN_HERE
+      - REDIS_HOST=redis
+    restart: always
