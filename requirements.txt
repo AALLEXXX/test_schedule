@@ -1,2 +1,4 @@
 aiogram==3.0.0b7
 redis==4.5.5
+apscheduler==3.9.1
+apscheduler-redis==0.4.0

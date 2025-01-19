@@ -1,132 +1,111 @@
 import asyncio
-import time
-import json
+import os
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher
-from aiogram.filters import Command
 from aiogram.types import Message
-from aiogram.enums import ParseMode
+from aiogram.filters import Command
 
-import redis.asyncio as aioredis
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.redis import RedisJobStore
 
 BOT_TOKEN = "8146060375:AAHxTGpUTCPUebui4GHpOeSrQoG5pMt2HeU"
-REDIS_HOST = "redis"  # Docker service name
+REDIS_HOST = "redis"  # по умолчанию 'redis', чтобы в docker-compose не менять
+REDIS_PORT = 6379  # Если нужно менять порт
 
-# Name of the sorted set in Redis where we store tasks
-REDIS_TASKS_KEY = "scheduled_tasks"
-
-# Delay for /reminde (in seconds): 1 hour = 3600 seconds
-REMINDER_DELAY = 3600
-
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Инициализируем планировщик с RedisJobStore
+# APScheduler будет сериализовать задачи в Redis.
+scheduler = AsyncIOScheduler(
+    jobstores={
+        "default": RedisJobStore(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=0
+            # при необходимости можно указать пароль, сериализатор и т.п.
+        )
+    }
+)
 
-async def get_redis_connection():
+
+async def send_reminder(user_id: int):
     """
-    Creates a connection to Redis.
-    By default, host is 'redis' (the service name in docker-compose).
+    Функция, которую вызовет APScheduler в нужное время, чтобы отправить сообщение пользователю.
     """
-    return aioredis.from_url(f"redis://{REDIS_HOST}", encoding="utf-8", decode_responses=True)
+    try:
+        await bot.send_message(chat_id=user_id, text="hello, im your bot")
+    except Exception as e:
+        print(f"Failed to send reminder to user {user_id}: {e}")
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     """
-    /start command: sends a greeting.
+    /start — приветствие.
     """
-    await message.answer("Hello! I'm your bot. Use /reminde to schedule a reminder.")
+    await message.answer("Hello! I'm your bot. Use /reminde to schedule a reminder in 1 hour.")
 
 
 @dp.message(Command("reminde"))
 async def cmd_reminde(message: Message):
     """
-    /reminde command: schedules a reminder in 1 hour.
+    /reminde — планирует задачу на отправку через 1 час.
     """
-    # Prepare the data we will store in Redis
     user_id = message.from_user.id
-    task_data = {
-        "user_id": user_id,
-        "text": "hello, im your bot"
-    }
+    # Время, когда нужно отправить сообщение
+    run_time = datetime.now() + timedelta(hours=1)
 
-    # Calculate the timestamp when we want to send the reminder
-    send_time = time.time() + REMINDER_DELAY
+    # Планируем задачу через APScheduler в Redis
+    job = scheduler.add_job(
+        send_reminder,
+        "date",                 # одноразовый запуск
+        run_date=run_time,      # конкретное время запуска
+        args=(user_id,)         # передаем user_id в send_reminder
+    )
 
-    # Save the task in a Redis sorted set
-    redis_conn = await get_redis_connection()
-    await redis_conn.zadd(REDIS_TASKS_KEY, {json.dumps(task_data): send_time})
-
-    await message.answer("Your reminder is set for 1 hour from now.")
+    # job.id — это уникальный идентификатор задачи,
+    # APScheduler самостоятельно генерирует, можно использовать для отмены/обновления.
+    answer_text = (
+        f"Your reminder is set for approximately {run_time}.\n\n"
+        f"Job ID: {job.id}"
+    )
+    await message.answer(answer_text)
 
 
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
     """
-    /list command: shows scheduled tasks for the user.
+    /list — выводит список задач, запланированных для пользователя.
     """
     user_id = message.from_user.id
-    current_time = time.time()
+    jobs = scheduler.get_jobs()  # подтянет задачи из Redis
 
-    redis_conn = await get_redis_connection()
+    # Отфильтруем только те, где в аргументах первый параметр == user_id
+    user_jobs = [job for job in jobs if job.args and job.args[0] == user_id]
 
-    # Get all tasks (with their scheduled times)
-    all_tasks = await redis_conn.zrange(REDIS_TASKS_KEY, 0, -1, withscores=True)
-
-    # Filter tasks for this user and those that haven't triggered yet
-    user_tasks = []
-    for task_json, timestamp in all_tasks:
-        task = json.loads(task_json)
-        if task.get("user_id") == user_id and timestamp > current_time:
-            # Convert timestamp to a rough "minutes from now" or local time
-            time_diff = int((timestamp - current_time) // 60)
-            user_tasks.append((task["text"], time_diff))
-
-    if not user_tasks:
+    if not user_jobs:
         await message.answer("No scheduled tasks.")
         return
 
     msg_lines = ["Your scheduled tasks:"]
-    for text, minutes_left in user_tasks:
-        msg_lines.append(f"- {text} (in ~{minutes_left} min)")
+    for job in user_jobs:
+        if job.next_run_time:
+            # next_run_time - это дата/время (datetime), когда задача будет выполнена
+            run_dt = job.next_run_time
+            msg_lines.append(f"- Job ID: {job.id}, run at: {run_dt}")
+        else:
+            msg_lines.append(f"- Job ID: {job.id}, no run_time (???).")
 
     await message.answer("\n".join(msg_lines))
 
 
-async def check_scheduled_tasks():
-    """
-    Background task: checks Redis for due tasks.
-    If a task is due, remove it from Redis and send the reminder.
-    """
-    redis_conn = await get_redis_connection()
-
-    while True:
-        now = time.time()
-        # Get tasks that are due: score <= now
-        due_tasks = await redis_conn.zrangebyscore(REDIS_TASKS_KEY, 0, now, withscores=True)
-
-        if due_tasks:
-            for task_json, _ in due_tasks:
-                # Remove the task from the sorted set
-                await redis_conn.zrem(REDIS_TASKS_KEY, task_json)
-                # Parse the task and send the message
-                task = json.loads(task_json)
-                user_id = task["user_id"]
-                text = task["text"]
-
-                try:
-                    await bot.send_message(chat_id=user_id, text=text)
-                except Exception as e:
-                    print(f"Failed to send message to {user_id}: {e}")
-
-        # Sleep a bit before checking again
-        await asyncio.sleep(10)
-
-
 async def main():
-    # Start the background task
-    asyncio.create_task(check_scheduled_tasks())
-    # Run dispatcher
+    # Запускаем планировщик (после инициализации jobstores)
+    scheduler.start()
+
+    # Запускаем long-polling бота
     await dp.start_polling(bot)
 
 
